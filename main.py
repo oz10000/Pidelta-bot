@@ -2,66 +2,116 @@
 import time
 import logging
 import sys
-from config import MODE, SYMBOL, TIMEFRAME, LEVERAGE, TP_PCT, SL_PCT, SCORE_THRESHOLD, STATE_FILE, LOG_FILE
+from datetime import datetime
+
+from config import (
+    MODE, ASSETS, TIMEFRAME, RISK_PER_TRADE, MAX_LEVERAGE,
+    SCORE_THRESHOLD, TRADE_HOURS_START, TRADE_HOURS_END,
+    STATE_FILE, LOG_FILE, API_KEY, SECRET_KEY, PASSPHRASE
+)
 from data.market_data import fetch_ohlcv
-from signal.signal_engine import compute_signal
+from signal.signal_engine import compute_signal_for_asset
 from execution.okx_adapter import OKXAdapter
 from monitor.position_manager import PositionManager
+from risk.position_sizing import calculate_contracts
+from utils.precision import get_step_size
 
-# Configurar logging
+# --- Configuración del sistema de logs ---
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.FileHandler(LOG_FILE),
-        logging.StreamHandler()
+        logging.StreamHandler(sys.stdout)
     ]
 )
-logger = logging.getLogger("PyDROID_BOT")
+logger = logging.getLogger("PideltaBot")
 
-def print_diagnostic(adapter):
+# ============================================================================
+#                           FUNCIONES AUXILIARES
+# ============================================================================
+
+def fetch_all_data(assets, timeframe, limit=200):
+    """Descarga datos históricos de todos los activos desde Binance."""
+    data = {}
+    for asset in assets:
+        # Se convierte el símbolo de OKX al formato de Binance
+        binance_sym = asset.replace(':USDT', '')
+        data[asset] = fetch_ohlcv(binance_sym, timeframe, limit)
+    return data
+
+def compute_all_signals(data, assets):
+    """Calcula la señal para cada activo de la lista usando BTC y ETH como macro."""
+    # Datos de BTC y ETH necesarios para el filtro macro de todos los activos
+    btc_data = data.get("BTC/USDT:USDT")
+    eth_data = data.get("ETH/USDT:USDT")
+    if btc_data is None or eth_data is None or btc_data.empty or eth_data.empty:
+        return {}
+
+    signals = {}
+    for asset in assets:
+        self_data = data.get(asset)
+        if self_data is None or self_data.empty:
+            continue
+        signals[asset] = compute_signal_for_asset(asset, self_data, btc_data, eth_data)
+    return signals
+
+def select_best_signal(signals):
+    """Selecciona el activo con la señal de mayor intensidad (abs(score))."""
+    best = None
+    best_abs = -1.0
+    for asset, sig in signals.items():
+        if sig['signal'] != 'none' and abs(sig['score']) > best_abs:
+            best_abs = abs(sig['score'])
+            best = sig
+    return best
+
+def print_startup_diagnostic(adapter):
+    """Muestra un diagnóstico del sistema y la conexión con OKX al iniciar."""
     logger.info("=== DIAGNÓSTICO DE INICIO ===")
     ok, msg = adapter.health_check()
     logger.info(f"OKX CONNECTION ....... {'OK' if ok else 'FAIL'} - {msg}")
     diff, time_ok = adapter.check_server_time()
     logger.info(f"SERVER TIME .......... {'OK' if time_ok else 'FAIL'} (diff={diff} ms)")
-    logger.info(f"SYMBOL ............... {SYMBOL}")
+    logger.info(f"ASSETS ............... {ASSETS}")
     logger.info(f"MODE ................. {MODE.upper()}")
-    logger.info(f"LEVERAGE ............. {LEVERAGE}x")
+    logger.info(f"MAX LEVERAGE ......... {MAX_LEVERAGE}x")
+    logger.info(f"RISK PER TRADE ....... {RISK_PER_TRADE*100:.1f}%")
+    logger.info(f"TRADE HOURS .......... {TRADE_HOURS_START}:00-{TRADE_HOURS_END}:00 UTC")
     try:
         bal = adapter.orders.fetch_balance()
         usdt = bal.get('USDT', {}).get('free', 0)
         logger.info(f"BALANCE ACCESS ....... OK (USDT free: {usdt:.2f})")
     except Exception as e:
         logger.info(f"BALANCE ACCESS ....... FAIL ({e})")
-    pos = adapter.fetch_position()
-    logger.info(f"POSITION ACCESS ...... OK (posición actual: {pos if pos else 'ninguna'})")
     logger.info("=====================================")
 
+# ============================================================================
+#                               BUCLE PRINCIPAL
+# ============================================================================
+
 def main():
-    # Pedir credenciales si no están en entorno
-    api_key = os.getenv("OKX_API_KEY")
-    secret = os.getenv("OKX_SECRET")
-    passphrase = os.getenv("OKX_PASSPHRASE")
+    # --- Obtención de credenciales ---
+    api_key = API_KEY
+    secret = SECRET_KEY
+    passphrase = PASSPHRASE
     if not api_key or not secret or not passphrase:
-        print("\n🔑 Ingresa tus credenciales OKX Demo:")
+        print("\n🔑 OKX Demo credentials required:")
         api_key = input("API Key: ").strip()
         secret = input("Secret Key: ").strip()
         passphrase = input("Passphrase: ").strip()
         if not api_key or not secret or not passphrase:
             logger.error("Credenciales incompletas. Abortando.")
             sys.exit(1)
-        # Opcional: guardarlas en variables de entorno para esta sesión
-        os.environ["OKX_API_KEY"] = api_key
-        os.environ["OKX_SECRET"] = secret
-        os.environ["OKX_PASSPHRASE"] = passphrase
 
-    logger.info(f"Iniciando PyDROID SOLANA CORE Ω en modo {MODE.upper()}")
+    # --- Inicialización de componentes ---
     adapter = OKXAdapter(api_key, secret, passphrase)
-    position_mgr = PositionManager(STATE_FILE)
+    pos_mgr = PositionManager(STATE_FILE)
 
-    print_diagnostic(adapter)
+    # --- Diagnóstico y comprobaciones iniciales ---
+    print_startup_diagnostic(adapter)
 
+    # Comprobación de la sincronización horaria
     diff, time_ok = adapter.check_server_time()
     if not time_ok:
         logger.error(f"Desincronización horaria crítica: diff={diff} ms. ABORTANDO.")
@@ -72,71 +122,112 @@ def main():
         logger.error(f"Health check falló: {msg}. ABORTANDO.")
         return
 
+    # --- Configuración inicial de los símbolos en OKX ---
+    for asset in ASSETS:
+        try:
+            adapter.setup_symbol(asset, MAX_LEVERAGE)
+            logger.info(f"Símbolo {asset} configurado: margen aislado, {MAX_LEVERAGE}x.")
+        except Exception as e:
+            logger.warning(f"No se pudo configurar {asset}: {e}")
+
+    # --- Bucle infinito de trading ---
     while True:
         try:
-            # 1. Obtener datos de mercado (Binance pública)
-            df_sol = fetch_ohlcv("SOL/USDT", TIMEFRAME, 200)
-            df_btc = fetch_ohlcv("BTC/USDT", TIMEFRAME, 200)
-            df_eth = fetch_ohlcv("ETH/USDT", TIMEFRAME, 200)
-            if df_sol.empty or df_btc.empty or df_eth.empty:
-                logger.warning("No se pudieron obtener datos, esperando...")
+            # 1. Filtro de horario (solo opera dentro de la ventana configurada)
+            current_hour = datetime.utcnow().hour
+            if not (TRADE_HOURS_START <= current_hour < TRADE_HOURS_END):
+                logger.info("Fuera de la ventana de trading. Esperando...")
+                time.sleep(300)
+                continue
+
+            # 2. Obtención de datos históricos de Binance
+            data = fetch_all_data(ASSETS, TIMEFRAME, limit=200)
+            if not data:
+                logger.warning("No se pudieron obtener los datos. Reintentando...")
                 time.sleep(60)
                 continue
 
-            # 2. Calcular señal
-            signal_data = compute_signal(df_sol, df_btc, df_eth)
-            logger.info(f"Señal: {signal_data['signal']}, score={signal_data['score']:.4f}")
+            # 3. Cálculo de señales para todos los activos
+            signals = compute_all_signals(data, ASSETS)
+            if not signals:
+                logger.warning("No se generaron señales válidas. Reintentando...")
+                time.sleep(60)
+                continue
 
-            # 3. Verificar posición existente
-            if position_mgr.has_open_position():
-                pos = adapter.fetch_position()
-                if pos is None:
-                    logger.warning("Inconsistencia: persistencia marca posición pero exchange no. Limpiando.")
-                    position_mgr.close_position()
+            # 4. Selección del activo con la mejor señal
+            best_signal = select_best_signal(signals)
+            if not best_signal:
+                logger.info("No hay activo con señal que supere el umbral.")
+                time.sleep(60)
+                continue
+
+            asset = best_signal['asset']
+            signal = best_signal['signal']   # 'long' or 'short'
+            score = best_signal['score']
+            atr = best_signal['atr']
+
+            logger.info(f"Mejor activo: {asset} | Señal: {signal} | Score: {score:.4f} | ATR: {atr:.4f}")
+
+            # 5. Verificación de posición abierta (persistencia)
+            if pos_mgr.has_open_position():
+                live_pos = adapter.fetch_position(asset)
+                if live_pos is None:
+                    logger.warning("Inconsistencia de estado: limpiando estado persistente...")
+                    pos_mgr.close_position()
                 else:
-                    logger.info(f"Posición activa detectada: {pos}. No se abre nueva.")
-                    time.sleep(300)
+                    logger.info("Ya hay una posición activa. No se abre una nueva.")
+                    time.sleep(60)
                     continue
 
-            # 4. Ejecutar trade si señal es válida
-            if abs(signal_data["score"]) > SCORE_THRESHOLD and signal_data["signal"] != "NONE":
-                current_price = df_sol["close"].iloc[-1]
-                balance = adapter.orders.fetch_balance()
-                usdt_balance = balance.get('USDT', {}).get('free', 0)
-                if usdt_balance <= 0:
-                    logger.error("Saldo insuficiente para operar.")
-                    time.sleep(300)
-                    continue
-                contracts = (usdt_balance * LEVERAGE) / current_price
-                contracts = round(contracts, 1)   # ajuste a step size de 0.1
-                if contracts <= 0:
-                    logger.error("Contratos calculados cero, no se opera.")
-                    time.sleep(300)
-                    continue
+            # 6. Obtención de datos de mercado y balance para el dimensionamiento
+            ticker = adapter.orders.exchange.fetch_ticker(asset)
+            current_price = ticker['last']
+            balance = adapter.orders.fetch_balance()
+            equity = balance.get('USDT', {}).get('free', 0)
 
-                side = "buy" if signal_data["signal"] == "LONG" else "sell"
-                order = adapter.place_market_order(side, contracts)
-                if not order or order.get('status') != 'closed':
-                    logger.error("Error al abrir orden market")
-                    continue
-                entry_price = float(order['price']) if 'price' in order else current_price
+            if equity <= 0:
+                logger.error("Saldo insuficiente en USDT.")
+                time.sleep(300)
+                continue
 
-                tp_pct = signal_data.get("tp_pct") if signal_data.get("tp_pct") is not None else TP_PCT
-                sl_pct = signal_data.get("sl_pct") if signal_data.get("sl_pct") is not None else SL_PCT
-                adapter.place_tp_sl(signal_data["signal"].lower(), contracts, entry_price, tp_pct, sl_pct)
-
-                tp_price = entry_price * (1 + tp_pct) if signal_data["signal"] == "LONG" else entry_price * (1 - tp_pct)
-                sl_price = entry_price * (1 - sl_pct) if signal_data["signal"] == "LONG" else entry_price * (1 + sl_pct)
-                position_mgr.open_position(SYMBOL, signal_data["signal"].lower(), contracts, entry_price, tp_price, sl_price)
-                logger.info(f"Trade ejecutado: {signal_data['signal']} {contracts} contratos @ {entry_price}")
+            # 7. Cálculo de precios de Stop Loss (fundamental para el dimensionamiento)
+            if signal == 'long':
+                sl_price = current_price - SL_ATR_MULT * atr
             else:
-                logger.info("No se cumplió el umbral de score o señal NONE")
+                sl_price = current_price + SL_ATR_MULT * atr
 
-            # Esperar hasta la siguiente vela de 5m
+            # 8. Dimensionamiento de la posición basado en el riesgo
+            contracts = calculate_contracts(
+                adapter.orders.exchange, asset, equity, RISK_PER_TRADE,
+                current_price, sl_price, MAX_LEVERAGE
+            )
+            if contracts <= 0:
+                logger.error("El número de contratos calculado es inválido. Cancelando operación.")
+                time.sleep(60)
+                continue
+
+            # 9. Ejecución de la orden de mercado
+            side = "buy" if signal == "long" else "sell"
+            order = adapter.open_position(asset, side, contracts)
+            if not order or order.get('status') not in ('closed', 'open'):
+                logger.error("Fallo en la ejecución de la orden de mercado.")
+                continue
+
+            entry_price = float(order.get('price', current_price))
+            logger.info(f"Posición abierta: {signal} {contracts} contratos de {asset} @ {entry_price}")
+
+            # 10. Colocación de las órdenes de Take Profit y Stop Loss
+            tp_price = entry_price + TP_ATR_MULT * atr if signal == 'long' else entry_price - TP_ATR_MULT * atr
+            adapter.set_tp_sl(asset, signal, contracts, entry_price, atr)
+
+            # 11. Persistencia del estado de la posición
+            pos_mgr.open_position(asset, signal, contracts, entry_price, tp_price, sl_price, atr)
+
+            # 12. Pausa de 5 minutos antes del siguiente ciclo
             time.sleep(300)
 
         except Exception as e:
-            logger.exception(f"Error en ciclo principal: {e}")
+            logger.exception(f"Error en el bucle principal del bot: {e}")
             time.sleep(60)
 
 if __name__ == "__main__":
